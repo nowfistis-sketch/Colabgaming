@@ -91,7 +91,7 @@ install_packages() {
   c_info "Cài gói apt (Xorg dummy, Xvfb, XFCE4, PulseAudio, tools)..."
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends \
-    ca-certificates curl wget jq gnupg lsb-release procps psmisc iproute2 software-properties-common x11-xserver-utils \
+    ca-certificates curl wget jq gnupg lsb-release procps psmisc iproute2 e2fsprogs software-properties-common x11-xserver-utils \
     xserver-xorg-core xserver-xorg-video-dummy xvfb \
     x11-xserver-utils x11-utils xdotool dbus-x11 xauth \
     xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-settings \
@@ -199,8 +199,30 @@ install_tailscale() {
   command -v tailscale >/dev/null && c_ok "Đã cài Tailscale." || { c_err "Cài Tailscale thất bại."; exit 1; }
 }
 
+# --- Bảo vệ DNS của container ------------------------------------------------
+# Ở chế độ userspace-networking, nếu Tailscale ghi 100.100.100.100 vào /etc/resolv.conf
+# thì DNS của Kaggle/Colab chết ngay (nameserver đó chỉ đi được qua SOCKS của tailscaled)
+# -> kernel Jupyter mất liên lạc với backend -> phiên "ngắt luôn" đúng lúc Tailscale lên.
+protect_resolv() {
+  [ -f "$WORK/resolv.conf.orig" ] || cp -L /etc/resolv.conf "$WORK/resolv.conf.orig" 2>/dev/null || true
+  # nếu resolv.conf là symlink (systemd-resolved) thì thay bằng file thật để khoá được
+  if [ -L /etc/resolv.conf ]; then rm -f /etc/resolv.conf; cp "$WORK/resolv.conf.orig" /etc/resolv.conf; fi
+  chattr +i /etc/resolv.conf 2>/dev/null || true
+}
+restore_resolv_if_hijacked() {
+  if grep -q '100\.100\.100\.100' /etc/resolv.conf 2>/dev/null; then
+    c_warn "Tailscale đã ghi đè /etc/resolv.conf -> khôi phục DNS gốc."
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    cp "$WORK/resolv.conf.orig" /etc/resolv.conf 2>/dev/null \
+      || printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+  fi
+}
+dns_ok() { getent hosts www.kaggle.com >/dev/null 2>&1 || getent hosts www.google.com >/dev/null 2>&1; }
+
 start_tailscale() {
   mkdir -p /var/lib/tailscale /run/tailscale
+  protect_resolv
   if ! is_running tailscaled; then
     c_info "Khởi động tailscaled (userspace-networking, không cần /dev/net/tun)..."
     daemon "$LOG/tailscaled.log" tailscaled --tun=userspace-networking \
@@ -211,10 +233,12 @@ start_tailscale() {
   fi
 
   if tailscale ip -4 >/dev/null 2>&1; then
-    c_ok "Tailscale đã đăng nhập: $(tailscale ip -4)"; return
+    c_ok "Tailscale đã đăng nhập: $(tailscale ip -4)"
+    restore_resolv_if_hijacked; return
   fi
 
-  local UP_ARGS=(--hostname="$TS_HOSTNAME" --accept-dns=false --reset)
+  # KHÔNG dùng --reset: một số bản khi reset sẽ áp lại pref mặc định (accept-dns=true)
+  local UP_ARGS=(--hostname="$TS_HOSTNAME" --accept-dns=false --accept-routes=false)
   if [ -n "$TS_AUTHKEY" ]; then
     c_info "tailscale up với auth key..."
     tailscale up "${UP_ARGS[@]}" --authkey="$TS_AUTHKEY" >"$LOG/tailscale-up.log" 2>&1
@@ -237,6 +261,10 @@ start_tailscale() {
   fi
   tailscale ip -4 >/dev/null 2>&1 && c_ok "Tailscale IP: $(tailscale ip -4)" \
                                    || { c_err "Tailscale chưa đăng nhập. Xem $LOG/tailscale-up.log"; exit 1; }
+  # kiểm tra DNS ngay sau khi lên: đây là chỗ Kaggle hay "ngắt luôn"
+  restore_resolv_if_hijacked
+  if dns_ok; then c_ok "DNS container vẫn hoạt động sau khi Tailscale lên."
+  else c_warn "DNS container KHÔNG phân giải được -> đã cố khôi phục; xem /etc/resolv.conf"; fi
 }
 
 # ----------------------------- 6. Sunshine ---------------------------------
@@ -636,6 +664,7 @@ keep_alive() {
   local i=0
   while true; do
     sleep 30; i=$((i+1))
+    restore_resolv_if_hijacked
     # đang tune/restart ở cell khác -> không can thiệp
     [ -e "$TUNE_LOCK" ] && continue
     if ! is_running sunshine; then
@@ -663,6 +692,7 @@ case "${1:-setup}" in
   tune)     tune_restart ;;
   netcheck) net_check ;;
   gpucheck) gpu_check ;;
+  dnsfix)   restore_resolv_if_hijacked; cat /etc/resolv.conf; dns_ok && c_ok "DNS OK" || c_err "DNS vẫn hỏng" ;;
   apps)     install_apps; write_sunshine_conf; tune_restart ;;
   stop)     stop_desktop ;;
   restart)  # dọn desktop stack rồi dựng lại (Tailscale giữ nguyên, không cần login lại)
@@ -673,13 +703,15 @@ case "${1:-setup}" in
     rm -f "$TUNE_LOCK"
     install_packages
     preflight_cleanup
+    # Cài hết phần nặng TRƯỚC khi bật Tailscale: nếu Kaggle vẫn ngắt đúng lúc Tailscale lên
+    # thì nguyên nhân là chính sách mạng, không phải DNS/apt.
+    install_sunshine
+    install_apps
     start_display
     start_audio
     start_xfce
     install_tailscale
     start_tailscale
-    install_sunshine
-    install_apps
     start_sunshine
     echo
     c_ok "HOÀN TẤT. Sunshine sẵn sàng qua Tailscale."
